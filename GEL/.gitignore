@@ -1,0 +1,58 @@
+# CLion specific files
+.idea/
+cmake-build-*/
+*.iml
+*.iws
+*.ipr
+
+# C++ build artifacts
+*.o
+*.obj
+*.exe
+*.out
+*.app
+*.dll
+*.so
+*.dylib
+
+# Modern C++ module artifacts
+gcm.cache/
+*.pcm
+
+# FPGA specific
+*.bit
+*.xpr
+*.jou
+*.str
+
+# Test results and logs (Week 2)
+test_results/
+visualizations/
+*.log
+
+# Build directories
+build/
+build_release/
+cmake-build-*/
+out/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# Python build / cache
+__pycache__/
+*.pyc
+
+# Unix/Linux specific build artifacts
+*.a
+*.so.*
+core
+core.*
+
+# Sample data (too large for git)
+data/*.csv
+
+#ignore ai settings
+./claude
+data/backup/*.csv

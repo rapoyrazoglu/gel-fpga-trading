@@ -1,0 +1,14 @@
+{
+  "strategies": [
+    {
+      "id": 1,
+      "name": "PCTA"
+    },
+    {
+      "id": 2,
+      "name": "MARKET_MAKER"
+    }
+  ],
+  "accounts": [],
+  "assignments": []
+}

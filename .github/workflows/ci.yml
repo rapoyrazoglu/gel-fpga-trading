@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: connector + MMX (${{ matrix.cxx }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Warnings are errors only where the tree is known to be clean.
+          - { cxx: clang++-18, werror: "ON" }
+          - { cxx: g++-14,     werror: "OFF" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_COMPILE_WARNING_AS_ERROR=${{ matrix.werror }}
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  regression:
+    name: offline regression (demos + GHDL)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GHDL
+        run: sudo apt-get update && sudo apt-get install -y ghdl
+      - name: Run
+        run: CXX=clang++-18 tools/run_offline_regression.sh
+
+  engine:
+    name: GEL engine
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev libeigen3-dev libcurl4-openssl-dev \
+            nlohmann-json3-dev libfmt-dev librange-v3-dev
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DGEL_BUILD_ENGINE=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

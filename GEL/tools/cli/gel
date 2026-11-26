@@ -1,0 +1,1583 @@
+#!/usr/bin/env python3
+"""gel — command-line frontend for the GEL execution engine.
+
+Linux-style: ``gel <noun> <verb> [flags]``. Run ``gel help`` for the full
+command tree, or ``gel <subcommand> --help`` for any single command.
+
+This is the local-mode CLI. A separate ``gelctl`` (next iteration) wraps
+the same commands in ssh for remote (AWS) operation. The two binaries
+share argument names so muscle memory transfers.
+
+Layout assumed:
+    capstone/
+      ├── GEL/          (this repo — engine + this CLI)
+      └── connector/    (sibling — SDK + admin web app)
+"""
+from __future__ import annotations
+
+import argparse
+import cmd
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+try:
+    import readline  # type: ignore  # arrow-keys + persistent history in REPL
+except ImportError:
+    readline = None  # type: ignore
+
+# ============================================================================
+# Constants & paths
+# ============================================================================
+
+GEL_ROOT       = Path(__file__).resolve().parents[2]
+CONNECTOR_ROOT = GEL_ROOT.parent / "connector"
+BUILD_DIR      = Path(os.environ.get("GEL_BUILD",     str(GEL_ROOT / "build")))
+CONFIG_DIR     = Path(os.environ.get("GEL_CONFIG",    str(GEL_ROOT / "config")))
+ACCOUNTS_JSON  = Path(os.environ.get("GEL_ACCOUNTS",
+                      str(CONNECTOR_ROOT / "tools/account_admin/accounts.json")))
+SYMBOLS_JSON   = Path(os.environ.get("GEL_SYMBOLS",   str(CONFIG_DIR / "symbols.json")))
+RISK_JSON      = Path(os.environ.get("GEL_RISK",      str(CONFIG_DIR / "risk.json")))
+# Per-user and private: a pid file in a world-writable directory lets another
+# user point `gel daemon stop` at an arbitrary process.
+_STATE_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or Path.home() / ".gel")
+DAEMON_PIDFILE = Path(os.environ.get("GEL_PIDFILE",   str(_STATE_DIR / "gel-daemon.pid")))
+DAEMON_LOGFILE = Path(os.environ.get("GEL_LOGFILE",   str(_STATE_DIR / "gel-daemon.log")))
+HISTORY_FILE   = Path(os.environ.get("GEL_HISTORY",   str(Path.home() / ".gel_history")))
+DEFAULT_ORDERS_SHM  = "/tmp/gel-orders.shm"
+DEFAULT_REPORTS_SHM = "/tmp/gel-reports.shm"
+
+VERSION = "0.1.0"
+
+# Reserved strategy ids that match connector::StrategyId enum values.
+KNOWN_STRATEGY_IDS = {1: "PCTA", 2: "MARKET_MAKER"}
+
+EXIT_OK             = 0
+EXIT_ERR            = 1
+EXIT_USAGE          = 2
+EXIT_NOT_FOUND      = 64
+EXIT_NOT_IMPLEMENTED = 65
+
+
+# ============================================================================
+# Output helpers (color, tables, JSON mode)
+# ============================================================================
+
+class Out:
+    """Wraps stdout. JSON mode silences human-readable output."""
+    def __init__(self) -> None:
+        self.json_mode = False
+        self.quiet     = False
+        self.use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+    def color(self, s: str, code: int) -> str:
+        return f"\033[{code}m{s}\033[0m" if self.use_color else s
+
+    def green (self, s: str) -> str: return self.color(s, 32)
+    def red   (self, s: str) -> str: return self.color(s, 31)
+    def yellow(self, s: str) -> str: return self.color(s, 33)
+    def blue  (self, s: str) -> str: return self.color(s, 36)
+    def dim   (self, s: str) -> str: return self.color(s, 2)
+    def bold  (self, s: str) -> str: return self.color(s, 1)
+
+    def info(self, msg: str) -> None:
+        if not self.json_mode and not self.quiet:
+            print(msg)
+
+    def ok(self, msg: str) -> None:
+        if not self.json_mode and not self.quiet:
+            print(self.green("ok ") + msg)
+
+    def warn(self, msg: str) -> None:
+        if not self.json_mode:
+            print(self.yellow("warn ") + msg, file=sys.stderr)
+
+    def err(self, msg: str) -> None:
+        if self.json_mode:
+            print(json.dumps({"error": msg}))
+        else:
+            print(self.red("error ") + msg, file=sys.stderr)
+
+    def json(self, obj: Any) -> None:
+        print(json.dumps(obj, indent=2, default=str))
+
+    def table(self, headers: list[str], rows: list[list[str]]) -> None:
+        if self.json_mode:
+            self.json([dict(zip(headers, r)) for r in rows])
+            return
+        if not rows:
+            print(self.dim("(empty)"))
+            return
+        widths = [len(h) for h in headers]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(str(cell)))
+        sep = "  "
+        print(self.bold(sep.join(h.ljust(widths[i]) for i, h in enumerate(headers))))
+        print(self.dim(sep.join("-" * w for w in widths)))
+        for row in rows:
+            print(sep.join(str(c).ljust(widths[i]) for i, c in enumerate(row)))
+
+
+out = Out()
+
+
+# ============================================================================
+# JSON state I/O
+# ============================================================================
+
+def _load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        out.err(f"corrupt JSON in {path}: {e}")
+        sys.exit(EXIT_ERR)
+
+
+def _save_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    tmp.replace(path)
+
+
+def load_accounts() -> dict:
+    return _load_json(ACCOUNTS_JSON, {
+        "strategies":  [{"id": 1, "name": "PCTA"}, {"id": 2, "name": "MARKET_MAKER"}],
+        "accounts":    [],
+        "assignments": [],
+    })
+
+
+def save_accounts(state: dict) -> None:
+    _save_json(ACCOUNTS_JSON, state)
+
+
+def load_symbols() -> dict:
+    return _load_json(SYMBOLS_JSON, {"symbols": []})
+
+
+def save_symbols(state: dict) -> None:
+    _save_json(SYMBOLS_JSON, state)
+
+
+def load_risk() -> dict:
+    return _load_json(RISK_JSON, {"limits": {}})
+
+
+def save_risk(state: dict) -> None:
+    _save_json(RISK_JSON, state)
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def _ensure_connector_module() -> Any:
+    """Import the connector Python module, building it on-demand if missing."""
+    candidates = [
+        CONNECTOR_ROOT / "python",
+        BUILD_DIR / "connector_build",
+    ]
+    for c in candidates:
+        if str(c) not in sys.path:
+            sys.path.insert(0, str(c))
+    try:
+        import connector  # type: ignore
+        return connector
+    except ImportError:
+        out.err("connector Python module not built. Run: gel build --target _connector_native")
+        sys.exit(EXIT_NOT_FOUND)
+
+
+def _find_binary(name: str, *, candidates: list[Path] | None = None) -> Path | None:
+    """Locate a built binary, checking GEL build dir + connector build dir."""
+    paths = candidates or [
+        BUILD_DIR / name,
+        BUILD_DIR / "connector_build" / name,
+        CONNECTOR_ROOT / "build" / name,
+        CONNECTOR_ROOT / "build" / "examples" / "cross_process" / name,
+        BUILD_DIR / "connector_build" / "examples" / "cross_process" / name,
+    ]
+    for p in paths:
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _strategy_name(state: dict, sid: int) -> str:
+    for s in state["strategies"]:
+        if s["id"] == sid:
+            return s["name"]
+    return f"#{sid}"
+
+
+def _account_label(state: dict, aid: int) -> str:
+    for a in state["accounts"]:
+        if a["id"] == aid:
+            return a["label"]
+    return f"#{aid}"
+
+
+def _validate_accounts_state(state: dict) -> str | None:
+    """Return error message or None."""
+    if not isinstance(state, dict):
+        return "state must be a JSON object"
+    for key in ("strategies", "accounts", "assignments"):
+        if key not in state or not isinstance(state[key], list):
+            return f"missing/non-list field: {key}"
+
+    sids = {s["id"] for s in state["strategies"]}
+    aids = {a["id"] for a in state["accounts"]}
+    if 0 in aids:
+        return "account id 0 is reserved (ACCOUNT_INVALID)"
+
+    seen: set[tuple[int, int]] = set()
+    for asn in state["assignments"]:
+        sid, aid = asn["strategy_id"], asn["account_id"]
+        if sid not in sids:
+            return f"assignment references unknown strategy {sid}"
+        if aid not in aids:
+            return f"assignment references unknown account {aid}"
+        if (sid, aid) in seen:
+            return f"duplicate assignment ({sid},{aid})"
+        seen.add((sid, aid))
+    return None
+
+
+# ============================================================================
+# Subcommands: accounts
+# ============================================================================
+
+def cmd_accounts_list(_args: argparse.Namespace) -> int:
+    state = load_accounts()
+    rows = []
+    for a in state["accounts"]:
+        rows.append([
+            a["id"],
+            a["label"],
+            a.get("venue", ""),
+            a.get("capital_units", 0),
+            "LIVE" if a.get("live") else "paper",
+            sum(1 for x in state["assignments"] if x["account_id"] == a["id"]),
+        ])
+    out.table(["id", "label", "venue", "capital", "mode", "strats"], rows)
+    return EXIT_OK
+
+
+def cmd_accounts_add(args: argparse.Namespace) -> int:
+    state = load_accounts()
+    if args.id == 0:
+        out.err("id 0 is reserved (ACCOUNT_INVALID)")
+        return EXIT_USAGE
+    if any(a["id"] == args.id for a in state["accounts"]):
+        out.err(f"account id {args.id} already exists")
+        return EXIT_USAGE
+    state["accounts"].append({
+        "id":            args.id,
+        "label":         args.label,
+        "venue":         args.venue,
+        "capital_units": args.capital,
+        "live":          args.live,
+    })
+    save_accounts(state)
+    out.ok(f"added account #{args.id} {args.label} ({args.venue}, "
+           f"{'LIVE' if args.live else 'paper'})")
+    return EXIT_OK
+
+
+def cmd_accounts_remove(args: argparse.Namespace) -> int:
+    state = load_accounts()
+    n = len(state["accounts"])
+    state["accounts"] = [a for a in state["accounts"] if a["id"] != args.id]
+    if len(state["accounts"]) == n:
+        out.err(f"no account with id {args.id}")
+        return EXIT_NOT_FOUND
+    removed_assignments = [x for x in state["assignments"] if x["account_id"] == args.id]
+    state["assignments"] = [x for x in state["assignments"] if x["account_id"] != args.id]
+    save_accounts(state)
+    out.ok(f"removed account #{args.id} (and {len(removed_assignments)} assignment(s))")
+    return EXIT_OK
+
+
+def cmd_accounts_show(args: argparse.Namespace) -> int:
+    state = load_accounts()
+    for a in state["accounts"]:
+        if a["id"] == args.id:
+            strats = [_strategy_name(state, x["strategy_id"])
+                      for x in state["assignments"] if x["account_id"] == args.id]
+            if out.json_mode:
+                out.json({**a, "strategies": strats})
+            else:
+                out.info(f"id:        {a['id']}")
+                out.info(f"label:     {a['label']}")
+                out.info(f"venue:     {a.get('venue', '')}")
+                out.info(f"capital:   {a.get('capital_units', 0)}")
+                out.info(f"live:      {a.get('live', False)}")
+                out.info(f"strategies: {', '.join(strats) if strats else '(none)'}")
+            return EXIT_OK
+    out.err(f"no account with id {args.id}")
+    return EXIT_NOT_FOUND
+
+
+# ============================================================================
+# Subcommands: strategies
+# ============================================================================
+
+def cmd_strategies_list(_args: argparse.Namespace) -> int:
+    state = load_accounts()
+    rows = []
+    for s in state["strategies"]:
+        builtin = "yes" if s["id"] in KNOWN_STRATEGY_IDS else "no"
+        accts = sum(1 for x in state["assignments"] if x["strategy_id"] == s["id"])
+        rows.append([s["id"], s["name"], builtin, accts])
+    out.table(["id", "name", "built-in", "accts"], rows)
+    return EXIT_OK
+
+
+def cmd_strategies_add(args: argparse.Namespace) -> int:
+    state = load_accounts()
+    if any(s["id"] == args.id for s in state["strategies"]):
+        out.err(f"strategy id {args.id} already exists")
+        return EXIT_USAGE
+    state["strategies"].append({"id": args.id, "name": args.name})
+    save_accounts(state)
+    out.ok(f"added strategy #{args.id} {args.name}")
+    return EXIT_OK
+
+
+def cmd_strategies_remove(args: argparse.Namespace) -> int:
+    state = load_accounts()
+    n = len(state["strategies"])
+    state["strategies"] = [s for s in state["strategies"] if s["id"] != args.id]
+    if len(state["strategies"]) == n:
+        out.err(f"no strategy with id {args.id}")
+        return EXIT_NOT_FOUND
+    removed = [x for x in state["assignments"] if x["strategy_id"] == args.id]
+    state["assignments"] = [x for x in state["assignments"] if x["strategy_id"] != args.id]
+    save_accounts(state)
+    out.ok(f"removed strategy #{args.id} (and {len(removed)} assignment(s))")
+    return EXIT_OK
+
+
+# ============================================================================
+# Subcommands: assign
+# ============================================================================
+
+def cmd_assign_list(_args: argparse.Namespace) -> int:
+    state = load_accounts()
+    rows = []
+    for x in state["assignments"]:
+        rows.append([
+            x["strategy_id"], _strategy_name(state, x["strategy_id"]),
+            x["account_id"],  _account_label(state, x["account_id"]),
+        ])
+    out.table(["sid", "strategy", "aid", "account"], rows)
+    return EXIT_OK
+
+
+def cmd_assign_add(args: argparse.Namespace) -> int:
+    state = load_accounts()
+    if not any(s["id"] == args.strategy for s in state["strategies"]):
+        out.err(f"unknown strategy id {args.strategy}")
+        return EXIT_USAGE
+    if not any(a["id"] == args.account for a in state["accounts"]):
+        out.err(f"unknown account id {args.account}")
+        return EXIT_USAGE
+    if any(x["strategy_id"] == args.strategy and x["account_id"] == args.account
+           for x in state["assignments"]):
+        out.err("already assigned")
+        return EXIT_USAGE
+    state["assignments"].append({"strategy_id": args.strategy, "account_id": args.account})
+    save_accounts(state)
+    out.ok(f"assigned {_strategy_name(state, args.strategy)} → "
+           f"{_account_label(state, args.account)}")
+    return EXIT_OK
+
+
+def cmd_assign_remove(args: argparse.Namespace) -> int:
+    state = load_accounts()
+    n = len(state["assignments"])
+    state["assignments"] = [x for x in state["assignments"]
+                            if not (x["strategy_id"] == args.strategy
+                                    and x["account_id"] == args.account)]
+    if len(state["assignments"]) == n:
+        out.err("no such assignment")
+        return EXIT_NOT_FOUND
+    save_accounts(state)
+    out.ok(f"unassigned strategy {args.strategy} from account {args.account}")
+    return EXIT_OK
+
+
+def cmd_assign_show(args: argparse.Namespace) -> int:
+    state = load_accounts()
+    if args.strategy is not None:
+        accts = [x["account_id"] for x in state["assignments"]
+                 if x["strategy_id"] == args.strategy]
+        if out.json_mode:
+            out.json({"strategy_id": args.strategy, "accounts": accts})
+        else:
+            label = _strategy_name(state, args.strategy)
+            out.info(f"{label} (#{args.strategy}) → {len(accts)} account(s):")
+            for aid in accts:
+                out.info(f"  #{aid:<6} {_account_label(state, aid)}")
+        return EXIT_OK
+    if args.account is not None:
+        sids = [x["strategy_id"] for x in state["assignments"]
+                if x["account_id"] == args.account]
+        if out.json_mode:
+            out.json({"account_id": args.account, "strategies": sids})
+        else:
+            label = _account_label(state, args.account)
+            out.info(f"{label} (#{args.account}) ← {len(sids)} strategy(ies):")
+            for sid in sids:
+                out.info(f"  #{sid:<6} {_strategy_name(state, sid)}")
+        return EXIT_OK
+    out.err("specify --strategy or --account")
+    return EXIT_USAGE
+
+
+# ============================================================================
+# Subcommands: symbols
+# ============================================================================
+
+def cmd_symbols_list(_args: argparse.Namespace) -> int:
+    state = load_symbols()
+    rows = [[s["ticker"], s.get("venue", ""), s.get("tick_size", 1), s.get("lot", 1)]
+            for s in state["symbols"]]
+    out.table(["ticker", "venue", "tick_size", "lot"], rows)
+    return EXIT_OK
+
+
+def cmd_symbols_add(args: argparse.Namespace) -> int:
+    state = load_symbols()
+    if any(s["ticker"] == args.ticker for s in state["symbols"]):
+        out.err(f"ticker {args.ticker} already exists")
+        return EXIT_USAGE
+    state["symbols"].append({
+        "ticker":    args.ticker,
+        "venue":     args.venue,
+        "tick_size": args.tick_size,
+        "lot":       args.lot,
+    })
+    save_symbols(state)
+    out.ok(f"added {args.ticker} @ {args.venue} (tick_size={args.tick_size}, lot={args.lot})")
+    return EXIT_OK
+
+
+def cmd_symbols_remove(args: argparse.Namespace) -> int:
+    state = load_symbols()
+    n = len(state["symbols"])
+    state["symbols"] = [s for s in state["symbols"] if s["ticker"] != args.ticker]
+    if len(state["symbols"]) == n:
+        out.err(f"no symbol named {args.ticker}")
+        return EXIT_NOT_FOUND
+    save_symbols(state)
+    out.ok(f"removed {args.ticker}")
+    return EXIT_OK
+
+
+# ============================================================================
+# Subcommands: risk
+# ============================================================================
+
+DEFAULT_RISK = {
+    "max_abs_position":    1_000_000,
+    "max_order_qty":       100_000,
+    "fat_finger_band_pct": 0.05,
+    "max_orders_per_sec":  10_000,
+}
+
+
+def cmd_risk_show(args: argparse.Namespace) -> int:
+    state = load_risk()
+    if args.strategy is not None:
+        limits = state["limits"].get(str(args.strategy), DEFAULT_RISK)
+        if out.json_mode:
+            out.json({"strategy_id": args.strategy, **limits})
+        else:
+            out.info(f"strategy #{args.strategy}:")
+            for k, v in limits.items():
+                out.info(f"  {k:<22} = {v}")
+        return EXIT_OK
+    rows = []
+    for sid, lim in state["limits"].items():
+        rows.append([sid, lim.get("max_abs_position"), lim.get("max_order_qty"),
+                     lim.get("fat_finger_band_pct"), lim.get("max_orders_per_sec")])
+    out.table(["sid", "max_pos", "max_order_qty", "fat_finger", "rate"], rows)
+    return EXIT_OK
+
+
+def cmd_risk_set(args: argparse.Namespace) -> int:
+    state = load_risk()
+    sid_key = str(args.strategy)
+    cur = state["limits"].setdefault(sid_key, dict(DEFAULT_RISK))
+    if args.max_position    is not None: cur["max_abs_position"]    = args.max_position
+    if args.max_order_qty   is not None: cur["max_order_qty"]       = args.max_order_qty
+    if args.fat_finger      is not None: cur["fat_finger_band_pct"] = args.fat_finger
+    if args.rate            is not None: cur["max_orders_per_sec"]  = args.rate
+    save_risk(state)
+    out.ok(f"updated risk limits for strategy #{args.strategy}")
+    if not out.json_mode:
+        for k, v in cur.items():
+            out.info(f"  {k:<22} = {v}")
+    return EXIT_OK
+
+
+# ============================================================================
+# Subcommands: config
+# ============================================================================
+
+def cmd_config_show(_args: argparse.Namespace) -> int:
+    bundle = {
+        "accounts": load_accounts(),
+        "symbols":  load_symbols(),
+        "risk":     load_risk(),
+        "paths":    {
+            "accounts": str(ACCOUNTS_JSON),
+            "symbols":  str(SYMBOLS_JSON),
+            "risk":     str(RISK_JSON),
+        },
+    }
+    out.json(bundle) if out.json_mode else _print_config_human(bundle)
+    return EXIT_OK
+
+
+def _print_config_human(bundle: dict) -> None:
+    out.info(out.bold("=== paths ==="))
+    for k, v in bundle["paths"].items():
+        out.info(f"  {k:<10} {v}")
+    out.info("")
+    out.info(out.bold("=== accounts (strategies/accounts/assignments) ==="))
+    out.info(f"  strategies:  {len(bundle['accounts']['strategies'])}")
+    out.info(f"  accounts:    {len(bundle['accounts']['accounts'])}")
+    out.info(f"  assignments: {len(bundle['accounts']['assignments'])}")
+    out.info("")
+    out.info(out.bold("=== symbols ==="))
+    out.info(f"  symbols: {len(bundle['symbols']['symbols'])}")
+    out.info("")
+    out.info(out.bold("=== risk ==="))
+    out.info(f"  configured strategies: {len(bundle['risk']['limits'])}")
+
+
+def cmd_config_validate(_args: argparse.Namespace) -> int:
+    err = _validate_accounts_state(load_accounts())
+    if err:
+        out.err(f"accounts.json: {err}")
+        return EXIT_ERR
+    out.ok("config valid")
+    return EXIT_OK
+
+
+def cmd_config_edit(_args: argparse.Namespace) -> int:
+    server = CONNECTOR_ROOT / "tools/account_admin/server.py"
+    if not server.exists():
+        out.err(f"admin server not found at {server}")
+        return EXIT_NOT_FOUND
+    out.info(f"launching account-admin web UI from {server}")
+    out.info("hit ctrl-c to stop")
+    return subprocess.call([sys.executable, str(server)])
+
+
+def cmd_config_path(_args: argparse.Namespace) -> int:
+    if out.json_mode:
+        out.json({
+            "accounts": str(ACCOUNTS_JSON),
+            "symbols":  str(SYMBOLS_JSON),
+            "risk":     str(RISK_JSON),
+            "config_dir": str(CONFIG_DIR),
+        })
+    else:
+        out.info(f"GEL_ROOT       = {GEL_ROOT}")
+        out.info(f"CONNECTOR_ROOT = {CONNECTOR_ROOT}")
+        out.info(f"CONFIG_DIR     = {CONFIG_DIR}")
+        out.info(f"BUILD_DIR      = {BUILD_DIR}")
+        out.info(f"  accounts.json = {ACCOUNTS_JSON}")
+        out.info(f"  symbols.json  = {SYMBOLS_JSON}")
+        out.info(f"  risk.json     = {RISK_JSON}")
+    return EXIT_OK
+
+
+# ============================================================================
+# Subcommands: build
+# ============================================================================
+
+def _cmake_configure_if_needed(debug: bool) -> int:
+    if (BUILD_DIR / "CMakeCache.txt").exists():
+        return EXIT_OK
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    btype = "Debug" if debug else "Release"
+    out.info(f"configuring (CMake, {btype}) …")
+    return subprocess.call(
+        ["cmake", "-B", str(BUILD_DIR), "-S", str(GEL_ROOT),
+         f"-DCMAKE_BUILD_TYPE={btype}"])
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    if args.action == "clean":
+        if BUILD_DIR.exists():
+            shutil.rmtree(BUILD_DIR)
+            out.ok(f"removed {BUILD_DIR}")
+        return EXIT_OK
+    rc = _cmake_configure_if_needed(args.debug)
+    if rc != 0: return rc
+    cmd = ["cmake", "--build", str(BUILD_DIR), "-j"]
+    if args.target:
+        cmd += ["--target", args.target]
+    out.info(" ".join(shlex.quote(c) for c in cmd))
+    return subprocess.call(cmd)
+
+
+# ============================================================================
+# Subcommands: run / verify
+# ============================================================================
+
+def _run_binary(name: str, *extra: str) -> int:
+    bin_path = _find_binary(name)
+    if bin_path is None:
+        out.err(f"{name} binary not built. Run: gel build --target {name}")
+        return EXIT_NOT_FOUND
+    out.info(f"$ {bin_path} {' '.join(extra)}".rstrip())
+    return subprocess.call([str(bin_path), *extra])
+
+
+def cmd_demo(_args: argparse.Namespace) -> int:
+    return _run_binary("gel_integrated_demo")
+
+
+def cmd_parity(_args: argparse.Namespace) -> int:
+    return _run_binary("connector_parity_test")
+
+
+def cmd_shm_test(_args: argparse.Namespace) -> int:
+    return _run_binary("connector_shm_roundtrip_test")
+
+
+# ============================================================================
+# Subcommands: ipc
+# ============================================================================
+
+def cmd_ipc_create(args: argparse.Namespace) -> int:
+    c = _ensure_connector_module()
+    # Creating ShmServer truncates and zeros the header; bind it briefly
+    # then drop the reference (the file persists).
+    Path(args.orders).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.reports).parent.mkdir(parents=True, exist_ok=True)
+    # connector module currently exposes ShmClient (attach), not ShmServer
+    # (create) directly to Python — so we shell out to gel_daemon for the
+    # creation step (it creates and then immediately drains).
+    daemon = _find_binary("gel_daemon")
+    if daemon is None:
+        out.err("gel_daemon binary not found. Run: gel build --target connector_gel_daemon")
+        return EXIT_NOT_FOUND
+    # Spawn briefly to create the files, then SIGTERM.
+    proc = subprocess.Popen([str(daemon), args.orders, args.reports],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.3)
+    proc.send_signal(signal.SIGTERM)
+    proc.wait()
+    # If user wanted the daemon to keep running, they should use `gel daemon start`.
+    out.ok(f"created {args.orders} and {args.reports}")
+    return EXIT_OK
+
+
+def cmd_ipc_status(args: argparse.Namespace) -> int:
+    c = _ensure_connector_module()
+    try:
+        client = c.ShmClient(args.orders, args.reports)
+    except RuntimeError as e:
+        out.err(str(e))
+        return EXIT_NOT_FOUND
+    if out.json_mode:
+        out.json({
+            "orders":          args.orders,
+            "reports":         args.reports,
+            "orders_pending":  client.orders_pending,
+            "reports_pending": client.reports_pending,
+        })
+    else:
+        out.info(f"orders   {args.orders}")
+        out.info(f"  pending: {client.orders_pending}")
+        out.info(f"reports  {args.reports}")
+        out.info(f"  pending: {client.reports_pending}")
+    return EXIT_OK
+
+
+def cmd_ipc_tap(args: argparse.Namespace) -> int:
+    c = _ensure_connector_module()
+    try:
+        client = c.ShmClient(args.orders, args.reports)
+    except RuntimeError as e:
+        out.err(str(e))
+        return EXIT_NOT_FOUND
+    out.info(f"tapping reports from {args.reports}  (ctrl-c to stop)")
+    out.info(out.bold("ts_ns      coid    sid  status   side  qty       price            account"))
+    try:
+        while True:
+            r = client.poll_report()
+            if r is None:
+                time.sleep(0.01)
+                continue
+            line = (f"{r.ts_ns:<10} {r.client_order_id:<7} "
+                    f"{r.strategy_id:<4} {r.status:<8} {r.side:<5} "
+                    f"{r.fill_quantity:<9} {r.fill_price_ticks:<16} "
+                    f"#{r.account_id}")
+            print(line)
+            if out.json_mode is False and args.count:
+                args.count -= 1
+                if args.count <= 0: break
+    except KeyboardInterrupt:
+        out.info("")
+        out.info("stopped.")
+    return EXIT_OK
+
+
+_SIDE_NAME_TO_ENUM = None  # lazy
+_TYPE_NAME_TO_ENUM = None
+
+
+def _side_enum(c: Any, name: str) -> Any:
+    return {"BUY": c.Side.BUY, "SELL": c.Side.SELL}[name]
+
+
+def _type_enum(c: Any, name: str) -> Any:
+    table = {"MARKET":    c.OrdType.MARKET,
+             "LIMIT":     c.OrdType.LIMIT,
+             "IOC":       c.OrdType.IOC,
+             "FOK":       c.OrdType.FOK,
+             "POST_ONLY": c.OrdType.POST_ONLY}
+    if hasattr(c.OrdType, "CANCEL"):
+        table["CANCEL"]  = c.OrdType.CANCEL
+        table["REPLACE"] = c.OrdType.REPLACE
+    return table[name]
+
+
+def _send_and_wait(client: Any, order: Any, wait: float) -> int:
+    if not client.send_order(order):
+        out.err("orders ring is full")
+        return EXIT_ERR
+    out.ok(f"sent coid={order.client_order_id} sid={order.strategy_id} "
+           f"sym={order.symbol_id} type={order.ord_type} qty={order.quantity}")
+    if wait <= 0:
+        return EXIT_OK
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        r = client.poll_report()
+        if r is not None and r.client_order_id == order.client_order_id:
+            if out.json_mode:
+                out.json({"status": r.status, "fill_qty": r.fill_quantity,
+                          "fill_price_ticks": r.fill_price_ticks,
+                          "account_id": r.account_id})
+            else:
+                out.info(f"  report: status={r.status} qty={r.fill_quantity} "
+                         f"price_ticks={r.fill_price_ticks} acct=#{r.account_id}")
+            return EXIT_OK
+        time.sleep(0.005)
+    out.warn(f"no report within {wait}s")
+    return EXIT_OK
+
+
+def cmd_ipc_send_order(args: argparse.Namespace) -> int:
+    c = _ensure_connector_module()
+    try:
+        client = c.ShmClient(args.orders, args.reports)
+    except RuntimeError as e:
+        out.err(str(e))
+        return EXIT_NOT_FOUND
+
+    o = c.Order()
+    o.ts_ns           = time.time_ns()
+    o.client_order_id = args.coid if args.coid else int(time.time_ns() & 0xFFFFFFFF)
+    o.strategy_id     = args.strategy
+    o.symbol_id       = args.symbol
+    o.account_id      = args.account
+    o.quantity        = args.qty
+    o.side            = int(_side_enum(c, args.side))
+    o.ord_type        = int(_type_enum(c, args.type))
+    o.tif             = int(c.TIF.DAY)
+    o.price_ticks     = -1 if args.type == "MARKET" else c.to_ticks(args.price or 0.0)
+    if hasattr(o, "ref_order_id") and args.ref_order_id is not None:
+        o.ref_order_id = args.ref_order_id
+    return _send_and_wait(client, o, args.wait)
+
+
+def cmd_ipc_cancel(args: argparse.Namespace) -> int:
+    c = _ensure_connector_module()
+    if not hasattr(c.OrdType, "CANCEL"):
+        out.err("CANCEL not supported by the loaded connector module — rebuild after wire.hpp update.")
+        return EXIT_NOT_IMPLEMENTED
+    try:
+        client = c.ShmClient(args.orders, args.reports)
+    except RuntimeError as e:
+        out.err(str(e))
+        return EXIT_NOT_FOUND
+
+    o = c.Order()
+    o.ts_ns           = time.time_ns()
+    o.client_order_id = int(time.time_ns() & 0xFFFFFFFF)
+    o.strategy_id     = args.strategy
+    o.symbol_id       = args.symbol or 0
+    o.account_id      = args.account
+    o.ord_type        = int(c.OrdType.CANCEL)
+    o.tif             = int(c.TIF.DAY)
+    o.price_ticks     = -1
+    o.quantity        = 0
+    o.side            = 0
+    o.ref_order_id    = args.coid
+    return _send_and_wait(client, o, args.wait)
+
+
+def cmd_ipc_replace(args: argparse.Namespace) -> int:
+    c = _ensure_connector_module()
+    if not hasattr(c.OrdType, "REPLACE"):
+        out.err("REPLACE not supported by the loaded connector module — rebuild after wire.hpp update.")
+        return EXIT_NOT_IMPLEMENTED
+    try:
+        client = c.ShmClient(args.orders, args.reports)
+    except RuntimeError as e:
+        out.err(str(e))
+        return EXIT_NOT_FOUND
+
+    o = c.Order()
+    o.ts_ns           = time.time_ns()
+    o.client_order_id = args.new_coid if args.new_coid else int(time.time_ns() & 0xFFFFFFFF)
+    o.strategy_id     = args.strategy
+    o.symbol_id       = args.symbol
+    o.account_id      = args.account
+    o.ord_type        = int(c.OrdType.REPLACE)
+    o.tif             = int(c.TIF.DAY)
+    o.price_ticks     = c.to_ticks(args.price)
+    o.quantity        = args.qty
+    o.side            = int(_side_enum(c, args.side))
+    o.ref_order_id    = args.coid
+    return _send_and_wait(client, o, args.wait)
+
+
+# ============================================================================
+# Subcommands: daemon
+# ============================================================================
+
+def _daemon_pid() -> int | None:
+    if not DAEMON_PIDFILE.exists():
+        return None
+    try:
+        pid = int(DAEMON_PIDFILE.read_text().strip())
+    except ValueError:
+        return None
+    try:
+        os.kill(pid, 0)
+        return pid
+    except ProcessLookupError:
+        return None
+
+
+def cmd_daemon_start(args: argparse.Namespace) -> int:
+    if _daemon_pid():
+        out.err(f"already running (pid {_daemon_pid()}). Use 'gel daemon stop' first.")
+        return EXIT_USAGE
+    daemon = _find_binary("gel_daemon")
+    if daemon is None:
+        out.err("gel_daemon binary not built. Run: gel build --target connector_gel_daemon")
+        return EXIT_NOT_FOUND
+    DAEMON_LOGFILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    DAEMON_PIDFILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log = open(DAEMON_LOGFILE, "ab")
+    proc = subprocess.Popen([str(daemon), args.orders, args.reports],
+                            stdout=log, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    DAEMON_PIDFILE.write_text(str(proc.pid))
+    time.sleep(0.2)
+    if proc.poll() is not None:
+        DAEMON_PIDFILE.unlink(missing_ok=True)
+        out.err(f"daemon exited immediately (rc={proc.returncode}). See {DAEMON_LOGFILE}")
+        return EXIT_ERR
+    out.ok(f"daemon started (pid {proc.pid})")
+    out.info(f"  orders : {args.orders}")
+    out.info(f"  reports: {args.reports}")
+    out.info(f"  log    : {DAEMON_LOGFILE}")
+    return EXIT_OK
+
+
+def cmd_daemon_stop(_args: argparse.Namespace) -> int:
+    pid = _daemon_pid()
+    if pid is None:
+        out.warn("no daemon running")
+        DAEMON_PIDFILE.unlink(missing_ok=True)
+        return EXIT_OK
+    try:
+        os.kill(pid, signal.SIGINT)
+    except ProcessLookupError:
+        pass
+    for _ in range(50):
+        time.sleep(0.05)
+        if _daemon_pid() is None:
+            DAEMON_PIDFILE.unlink(missing_ok=True)
+            out.ok(f"stopped (pid {pid})")
+            return EXIT_OK
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    DAEMON_PIDFILE.unlink(missing_ok=True)
+    out.warn(f"forced kill (pid {pid})")
+    return EXIT_OK
+
+
+def cmd_daemon_status(_args: argparse.Namespace) -> int:
+    pid = _daemon_pid()
+    if pid is None:
+        if out.json_mode:
+            out.json({"running": False})
+        else:
+            out.info(out.dim("not running"))
+        return EXIT_NOT_FOUND
+    if out.json_mode:
+        out.json({"running": True, "pid": pid,
+                  "logfile": str(DAEMON_LOGFILE), "pidfile": str(DAEMON_PIDFILE)})
+    else:
+        out.info(out.green(f"running (pid {pid})"))
+        out.info(f"  log    : {DAEMON_LOGFILE}")
+        out.info(f"  pidfile: {DAEMON_PIDFILE}")
+    return EXIT_OK
+
+
+# ============================================================================
+# Subcommands: tools
+# ============================================================================
+
+def cmd_admin(_args: argparse.Namespace) -> int:
+    return cmd_config_edit(_args)
+
+
+def cmd_python(_args: argparse.Namespace) -> int:
+    """Drop into a Python REPL with `connector` and helpers pre-imported."""
+    c = _ensure_connector_module()
+    banner = textwrap.dedent(f"""
+        gel python REPL
+          connector module loaded as `c` and `connector`
+          GEL_ROOT       = {GEL_ROOT}
+          CONNECTOR_ROOT = {CONNECTOR_ROOT}
+          BUILD_DIR      = {BUILD_DIR}
+        examples:
+          o = c.Order.market(sid=1, qty=100, side=c.Side.BUY)
+          client = c.ShmClient("{DEFAULT_ORDERS_SHM}", "{DEFAULT_REPORTS_SHM}")
+    """).strip()
+    import code
+    namespace = {"connector": c, "c": c, "Path": Path,
+                 "GEL_ROOT": GEL_ROOT, "CONNECTOR_ROOT": CONNECTOR_ROOT}
+    code.interact(banner=banner, local=namespace, exitmsg="bye")
+    return EXIT_OK
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    checks: list[tuple[str, bool, str]] = []
+
+    checks.append(("GEL repo root",  GEL_ROOT.exists(),       str(GEL_ROOT)))
+    checks.append(("connector repo", CONNECTOR_ROOT.exists(), str(CONNECTOR_ROOT)))
+    checks.append(("CMake available", shutil.which("cmake") is not None,
+                   shutil.which("cmake") or ""))
+    checks.append(("ssh available",   shutil.which("ssh")   is not None,
+                   shutil.which("ssh")   or ""))
+
+    for name in ["gel_integrated_demo", "connector_parity_test",
+                 "connector_shm_roundtrip_test", "gel_daemon"]:
+        b = _find_binary(name)
+        checks.append((f"binary: {name}", b is not None, str(b) if b else "(not built)"))
+
+    try:
+        sys.path.insert(0, str(CONNECTOR_ROOT / "python"))
+        import connector  # noqa: F401
+        py_msg = "imported"
+        py_ok  = True
+    except ImportError as e:
+        py_msg = f"FAIL: {e}"
+        py_ok  = False
+    checks.append(("python: connector", py_ok, py_msg))
+
+    for label, path in [("config: accounts.json", ACCOUNTS_JSON),
+                        ("config: symbols.json",  SYMBOLS_JSON),
+                        ("config: risk.json",     RISK_JSON)]:
+        checks.append((label, path.exists(), str(path)))
+
+    err = _validate_accounts_state(load_accounts())
+    checks.append(("accounts.json valid", err is None, err or "schema ok"))
+
+    if out.json_mode:
+        out.json([{"check": c, "ok": k, "detail": d} for c, k, d in checks])
+        return EXIT_OK if all(k for _, k, _ in checks) else EXIT_ERR
+
+    for label, ok_, detail in checks:
+        marker = out.green("✓") if ok_ else out.red("✗")
+        print(f" {marker}  {label:<28} {out.dim(detail)}")
+    failed = [c for c, k, _ in checks if not k]
+    print()
+    if failed:
+        print(out.red(f"{len(failed)} check(s) failed"))
+        return EXIT_ERR
+    print(out.green("all checks passed"))
+    return EXIT_OK
+
+
+# ============================================================================
+# Subcommands: status / connect / disconnect (REPL family)
+# ============================================================================
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    """High-level system status: daemon + config + binaries."""
+    pid = _daemon_pid()
+    accts = load_accounts()
+    syms  = load_symbols()
+    risk  = load_risk()
+    bins  = {n: _find_binary(n) is not None for n in
+             ["gel_integrated_demo", "gel_daemon",
+              "connector_parity_test", "connector_shm_roundtrip_test"]}
+    if out.json_mode:
+        out.json({
+            "daemon":  {"running": pid is not None, "pid": pid},
+            "config":  {"strategies":      len(accts["strategies"]),
+                        "accounts":        len(accts["accounts"]),
+                        "assignments":     len(accts["assignments"]),
+                        "symbols":         len(syms["symbols"]),
+                        "risk_strategies": len(risk["limits"])},
+            "binaries": bins,
+        })
+        return EXIT_OK
+    out.info(out.bold("daemon"))
+    if pid:
+        out.info(f"  {out.green('running')} (pid {pid})")
+    else:
+        out.info(f"  {out.dim('not running')}")
+    out.info("")
+    out.info(out.bold("config"))
+    out.info(f"  strategies:  {len(accts['strategies'])}")
+    out.info(f"  accounts:    {len(accts['accounts'])}")
+    out.info(f"  assignments: {len(accts['assignments'])}")
+    out.info(f"  symbols:     {len(syms['symbols'])}")
+    out.info(f"  risk lims:   {len(risk['limits'])} strategy(ies)")
+    out.info("")
+    out.info(out.bold("binaries"))
+    for name, ok_ in bins.items():
+        marker = out.green("yes") if ok_ else out.red("no ")
+        out.info(f"  {marker}  {name}")
+    return EXIT_OK
+
+
+def cmd_connect(args: argparse.Namespace) -> int:
+    """Enter the interactive REPL, optionally starting the daemon."""
+    if not args.no_start_daemon and _daemon_pid() is None:
+        if _find_binary("gel_daemon") is not None:
+            rc = cmd_daemon_start(args)
+            if rc != 0:
+                out.warn("daemon failed to start; REPL will run without it")
+        else:
+            out.warn("gel_daemon binary not built; ipc commands will fail")
+    GelRepl().cmdloop()
+    return EXIT_OK
+
+
+def cmd_disconnect(args: argparse.Namespace) -> int:
+    """Stop the daemon (and exit the REPL if we're in one)."""
+    return cmd_daemon_stop(args)
+
+
+# ----------------------------------------------------------------------------
+# REPL — interactive shell
+# ----------------------------------------------------------------------------
+
+# Top-level commands the REPL recognizes for tab completion. Must stay in
+# sync with build_parser()'s subparsers.
+REPL_COMMANDS = [
+    "accounts", "strategies", "assign", "symbols", "risk", "config",
+    "build", "demo", "parity", "shm-test", "ipc", "daemon",
+    "admin", "python", "doctor", "backtest", "version",
+    "status", "connect", "disconnect", "claude",
+    "exit", "quit", "clear", "help",
+]
+
+
+class GelRepl(cmd.Cmd):
+    intro = textwrap.dedent("""\
+        gel — interactive session
+        commands work without the 'gel' prefix:  accounts list / assign add ...
+        type 'help' for the command tree, 'status' for daemon state,
+             'exit' (or ctrl-d) to leave""")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parser = build_parser()
+        self._update_prompt()
+
+    # ---- prompt ----------------------------------------------------------
+    def _update_prompt(self) -> None:
+        pid = _daemon_pid()
+        if pid:
+            tag = f"gel(pid {pid})"
+            self.prompt = (out.green(tag) + " > ") if out.use_color else tag + " > "
+        else:
+            tag = "gel(off)"
+            self.prompt = (out.dim(tag) + " > ") if out.use_color else tag + " > "
+
+    # ---- history ---------------------------------------------------------
+    def preloop(self) -> None:
+        if readline is not None and HISTORY_FILE.exists():
+            try:
+                readline.read_history_file(str(HISTORY_FILE))
+            except OSError:
+                pass
+
+    def postloop(self) -> None:
+        if readline is not None:
+            readline.set_history_length(2000)
+            try:
+                readline.write_history_file(str(HISTORY_FILE))
+            except OSError:
+                pass
+
+    # ---- cmd.Cmd plumbing -----------------------------------------------
+    def emptyline(self) -> bool:
+        return False  # don't repeat the last command
+
+    def postcmd(self, stop: bool, _line: str) -> bool:
+        self._update_prompt()
+        return stop
+
+    def completenames(self, text: str, *_ignored: Any) -> list[str]:
+        return [c for c in REPL_COMMANDS if c.startswith(text)]
+
+    # ---- dispatch --------------------------------------------------------
+    def default(self, line: str) -> bool | None:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return False
+
+        # REPL-only built-ins first.
+        if line in ("exit", "quit", r"\q", "q"):
+            return True
+        if line == "clear":
+            os.system("clear" if os.name != "nt" else "cls")
+            return False
+        if line == "?":
+            line = "help"
+
+        # Otherwise re-parse as if the user had run it from the shell.
+        try:
+            argv = shlex.split(line)
+        except ValueError as e:
+            out.err(f"parse error: {e}")
+            return False
+
+        # Save global flag state — REPL commands may pass --json/--quiet but
+        # those should affect *that* command only, not the whole session.
+        saved = (out.json_mode, out.quiet, out.use_color)
+        try:
+            args = self.parser.parse_args(argv)
+            if getattr(args, "json", False):     out.json_mode = True
+            if getattr(args, "quiet", False):    out.quiet     = True
+            if getattr(args, "no_color", False): out.use_color = False
+            if hasattr(args, "func") and args.func:
+                args.func(args)
+        except SystemExit:
+            # argparse calls sys.exit on --help and on bad args; suppress.
+            pass
+        except KeyboardInterrupt:
+            out.info("")  # ctrl-c during a long-running command
+        except Exception as e:
+            out.err(f"{type(e).__name__}: {e}")
+        finally:
+            out.json_mode, out.quiet, out.use_color = saved
+        return False
+
+    # ---- explicit do_* for nicer help/completion -------------------------
+    def do_help(self, arg: str) -> bool:
+        if arg.strip():
+            return self.default(f"{arg} --help") or False
+        cmd_help_full(argparse.Namespace())
+        out.info("")
+        out.info(out.dim("REPL extras:"))
+        out.info(out.dim("  status, connect, disconnect, clear, exit, quit, !<shell-cmd>"))
+        return False
+
+    def do_exit(self, _arg: str) -> bool: return True
+    def do_quit(self, _arg: str) -> bool: return True
+
+    def do_EOF(self, _arg: str) -> bool:  # ctrl-d
+        print()
+        return True
+
+    def do_claude(self, arg: str) -> bool:
+        """Spawn Claude Code as a subprocess. The gel REPL resumes when
+        claude exits. This works the same whether you're running gel
+        locally or via `gelctl connect` (which is ssh-wrapped) — claude
+        is invoked on whichever machine the gel REPL is running on.
+        Pass extra args after `claude`, e.g. `claude --resume`.
+        """
+        if not shutil.which("claude"):
+            out.err("claude not on PATH. On this machine run: "
+                    "tools/aws/install-claude.sh   (or `npm i -g @anthropic-ai/claude-code`)")
+            return False
+        cmd = ["claude"]
+        if arg.strip():
+            try:
+                cmd += shlex.split(arg)
+            except ValueError as e:
+                out.err(f"parse error: {e}")
+                return False
+        out.info(out.dim("(launching claude — exit it to return here)"))
+        try:
+            subprocess.call(cmd)
+        except KeyboardInterrupt:
+            print()
+        return False
+
+
+# ============================================================================
+# Subcommands: backtest (stub)
+# ============================================================================
+
+def cmd_backtest_stub(_args: argparse.Namespace) -> int:
+    out.warn("backtest engine not implemented yet")
+    out.info("Planned: replay historical ticks across multiple strategies, ")
+    out.info("        attribute fills/PnL per (strategy, account), produce report.")
+    return EXIT_NOT_IMPLEMENTED
+
+
+# ============================================================================
+# Subcommands: version & help
+# ============================================================================
+
+def cmd_version(_args: argparse.Namespace) -> int:
+    git_rev = "unknown"
+    try:
+        git_rev = subprocess.check_output(
+            ["git", "-C", str(GEL_ROOT), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True).strip() or "unknown"
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    info = {
+        "version":    VERSION,
+        "git_rev":    git_rev,
+        "gel_root":   str(GEL_ROOT),
+        "connector":  str(CONNECTOR_ROOT),
+        "python":     sys.version.split()[0],
+    }
+    if out.json_mode:
+        out.json(info)
+    else:
+        out.info(f"gel CLI v{VERSION} ({git_rev})")
+        out.info(f"  GEL       : {GEL_ROOT}")
+        out.info(f"  connector : {CONNECTOR_ROOT}")
+        out.info(f"  python    : {info['python']}")
+    return EXIT_OK
+
+
+def cmd_help_full(_args: argparse.Namespace) -> int:
+    """Print the entire command tree, organized by topic."""
+    print(out.bold("gel — GEL execution engine CLI"))
+    print(out.dim(f"version {VERSION}\n"))
+    sections: list[tuple[str, list[tuple[str, str]]]] = [
+        ("config", [
+            ("accounts list",        "show all broker accounts"),
+            ("accounts add",         "register a new account (--id --label …)"),
+            ("accounts remove",      "remove an account by id"),
+            ("accounts show",        "full detail for one account"),
+            ("strategies list",      "show registered strategies"),
+            ("strategies add",       "add a new strategy (--id --name)"),
+            ("strategies remove",    "remove a strategy by id"),
+            ("assign list",          "show all strategy↔account links"),
+            ("assign add",           "link a strategy to an account"),
+            ("assign remove",        "unlink"),
+            ("assign show",          "show links for one side"),
+            ("symbols list",         "show registered symbols"),
+            ("symbols add",          "register a symbol (--ticker --venue …)"),
+            ("symbols remove",       "remove a symbol"),
+            ("risk show",            "view risk limits"),
+            ("risk set",             "update risk limits for a strategy"),
+            ("config show",          "print full bundled config"),
+            ("config validate",      "schema check"),
+            ("config edit",          "open the account-admin web UI"),
+            ("config path",          "print resolved config paths"),
+        ]),
+        ("build", [
+            ("build",                "configure if needed and build"),
+            ("build --target T",     "build a single CMake target"),
+            ("build clean",          "rm the build dir"),
+        ]),
+        ("run / verify", [
+            ("demo",                 "run gel_integrated_demo"),
+            ("parity",               "run connector_parity_test"),
+            ("shm-test",             "run connector_shm_roundtrip_test"),
+        ]),
+        ("ipc (cross-process)", [
+            ("ipc create",           "create the SHM ring files"),
+            ("ipc status",           "show pending counts"),
+            ("ipc tap",              "live-tail incoming ExecReports"),
+            ("ipc send-order",       "send a single order via SHM"),
+            ("ipc cancel",           "send a CANCEL for an open order"),
+            ("ipc replace",          "send a REPLACE for an open order"),
+        ]),
+        ("daemon", [
+            ("daemon start",         "spawn gel_daemon in the background"),
+            ("daemon stop",          "send SIGINT, then SIGKILL after 2.5s"),
+            ("daemon status",        "running? pid? logfile?"),
+        ]),
+        ("session (REPL)", [
+            ("connect",              "enter interactive REPL (auto-starts daemon)"),
+            ("connect --no-start-daemon", "REPL without auto-starting the daemon"),
+            ("disconnect",           "stop the daemon"),
+            ("status",               "daemon + config + binaries summary"),
+            ("claude",               "spawn Claude Code from the REPL (returns on exit)"),
+        ]),
+        ("tools", [
+            ("admin",                "open the account-admin web UI"),
+            ("python",               "Python REPL with `connector` imported"),
+            ("doctor",               "environment health check"),
+            ("backtest",             "(stub — not implemented yet)"),
+            ("version",              "version info"),
+            ("help",                 "this listing"),
+        ]),
+    ]
+    for section_name, cmds in sections:
+        print(out.bold(f"  {section_name}"))
+        for c, desc in cmds:
+            print(f"    {out.green('gel ' + c):<40} {out.dim(desc)}")
+        print()
+    print(out.dim("global flags: --json   --quiet   --no-color"))
+    print(out.dim("any command:  gel <cmd> --help    for full flag list"))
+    return EXIT_OK
+
+
+# ============================================================================
+# Argument parser
+# ============================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="gel",
+        description="GEL execution engine CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--json",   action="store_true", help="machine-readable JSON output")
+    p.add_argument("--quiet",  action="store_true", help="suppress non-essential output")
+    p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    sub = p.add_subparsers(dest="cmd", required=False)
+
+    def add(name: str, **kw) -> argparse.ArgumentParser:
+        return sub.add_parser(name, **kw)
+
+    def nest(parent: argparse.ArgumentParser) -> Any:
+        return parent.add_subparsers(dest="sub", required=True)
+
+    # ---- accounts ----
+    accounts = nest(add("accounts", help="manage broker accounts"))
+    accounts.add_parser("list", help="list accounts").set_defaults(func=cmd_accounts_list)
+    a_add = accounts.add_parser("add", help="register a new account")
+    a_add.add_argument("--id",      type=int, required=True)
+    a_add.add_argument("--label",   required=True)
+    a_add.add_argument("--venue",   default="OANDA")
+    a_add.add_argument("--capital", type=int, default=100_000, help="capital units")
+    a_add.add_argument("--live",    action="store_true", help="real money (default: paper)")
+    a_add.set_defaults(func=cmd_accounts_add)
+    a_rm = accounts.add_parser("remove", help="remove an account by id")
+    a_rm.add_argument("--id", type=int, required=True)
+    a_rm.set_defaults(func=cmd_accounts_remove)
+    a_sh = accounts.add_parser("show", help="show full detail for one account")
+    a_sh.add_argument("--id", type=int, required=True)
+    a_sh.set_defaults(func=cmd_accounts_show)
+
+    # ---- strategies ----
+    strategies = nest(add("strategies", help="manage strategy registry"))
+    strategies.add_parser("list").set_defaults(func=cmd_strategies_list)
+    s_add = strategies.add_parser("add")
+    s_add.add_argument("--id",   type=int, required=True)
+    s_add.add_argument("--name", required=True)
+    s_add.set_defaults(func=cmd_strategies_add)
+    s_rm = strategies.add_parser("remove")
+    s_rm.add_argument("--id", type=int, required=True)
+    s_rm.set_defaults(func=cmd_strategies_remove)
+
+    # ---- assign ----
+    assign = nest(add("assign", help="strategy ↔ account assignments"))
+    assign.add_parser("list").set_defaults(func=cmd_assign_list)
+    asn_a = assign.add_parser("add", help="link a strategy to an account")
+    asn_a.add_argument("--strategy", type=int, required=True)
+    asn_a.add_argument("--account",  type=int, required=True)
+    asn_a.set_defaults(func=cmd_assign_add)
+    asn_r = assign.add_parser("remove", help="unlink")
+    asn_r.add_argument("--strategy", type=int, required=True)
+    asn_r.add_argument("--account",  type=int, required=True)
+    asn_r.set_defaults(func=cmd_assign_remove)
+    asn_s = assign.add_parser("show", help="show links for one side")
+    asn_s.add_argument("--strategy", type=int)
+    asn_s.add_argument("--account",  type=int)
+    asn_s.set_defaults(func=cmd_assign_show)
+
+    # ---- symbols ----
+    symbols = nest(add("symbols", help="manage symbol registry"))
+    symbols.add_parser("list").set_defaults(func=cmd_symbols_list)
+    sy_add = symbols.add_parser("add")
+    sy_add.add_argument("--ticker",     required=True)
+    sy_add.add_argument("--venue",      default="OANDA")
+    sy_add.add_argument("--tick-size",  type=int, default=1)
+    sy_add.add_argument("--lot",        type=int, default=1)
+    sy_add.set_defaults(func=cmd_symbols_add)
+    sy_rm = symbols.add_parser("remove")
+    sy_rm.add_argument("--ticker", required=True)
+    sy_rm.set_defaults(func=cmd_symbols_remove)
+
+    # ---- risk ----
+    risk = nest(add("risk", help="risk limits per strategy"))
+    rk_sh = risk.add_parser("show")
+    rk_sh.add_argument("--strategy", type=int)
+    rk_sh.set_defaults(func=cmd_risk_show)
+    rk_st = risk.add_parser("set")
+    rk_st.add_argument("--strategy",       type=int, required=True)
+    rk_st.add_argument("--max-position",   type=int)
+    rk_st.add_argument("--max-order-qty",  type=int)
+    rk_st.add_argument("--fat-finger",     type=float, dest="fat_finger")
+    rk_st.add_argument("--rate",           type=int)
+    rk_st.set_defaults(func=cmd_risk_set)
+
+    # ---- config ----
+    config = nest(add("config", help="config files"))
+    config.add_parser("show",     help="print bundled config").set_defaults(func=cmd_config_show)
+    config.add_parser("validate", help="schema check").set_defaults(func=cmd_config_validate)
+    config.add_parser("edit",     help="open admin web UI").set_defaults(func=cmd_config_edit)
+    config.add_parser("path",     help="print config paths").set_defaults(func=cmd_config_path)
+
+    # ---- build ----
+    bld = add("build", help="build GEL + connector targets")
+    bld.add_argument("action", nargs="?", choices=["clean"])
+    bld.add_argument("--target")
+    bld.add_argument("--debug",  action="store_true")
+    bld.set_defaults(func=cmd_build)
+
+    # ---- run / verify ----
+    add("demo",     help="run gel_integrated_demo").set_defaults(func=cmd_demo)
+    add("parity",   help="run connector_parity_test").set_defaults(func=cmd_parity)
+    add("shm-test", help="run connector_shm_roundtrip_test").set_defaults(func=cmd_shm_test)
+
+    # ---- ipc ----
+    ipc = nest(add("ipc", help="cross-process IPC ops (SHM)"))
+    ipc_c = ipc.add_parser("create", help="create the SHM ring files")
+    ipc_c.add_argument("--orders",  default=DEFAULT_ORDERS_SHM)
+    ipc_c.add_argument("--reports", default=DEFAULT_REPORTS_SHM)
+    ipc_c.set_defaults(func=cmd_ipc_create)
+    ipc_s = ipc.add_parser("status", help="show pending counts")
+    ipc_s.add_argument("--orders",  default=DEFAULT_ORDERS_SHM)
+    ipc_s.add_argument("--reports", default=DEFAULT_REPORTS_SHM)
+    ipc_s.set_defaults(func=cmd_ipc_status)
+    ipc_t = ipc.add_parser("tap", help="live-tail incoming ExecReports")
+    ipc_t.add_argument("--orders",  default=DEFAULT_ORDERS_SHM)
+    ipc_t.add_argument("--reports", default=DEFAULT_REPORTS_SHM)
+    ipc_t.add_argument("--count", type=int, help="exit after N reports")
+    ipc_t.set_defaults(func=cmd_ipc_tap)
+    ipc_so = ipc.add_parser("send-order", help="send a single order via SHM")
+    ipc_so.add_argument("--strategy", type=int, required=True)
+    ipc_so.add_argument("--symbol",   type=int, required=True)
+    ipc_so.add_argument("--side",     choices=["BUY", "SELL"], required=True)
+    ipc_so.add_argument("--qty",      type=int, required=True)
+    ipc_so.add_argument("--price",    type=float)
+    ipc_so.add_argument("--type",     choices=["MARKET", "LIMIT", "IOC", "FOK", "POST_ONLY",
+                                               "CANCEL", "REPLACE"], default="MARKET")
+    ipc_so.add_argument("--account",       type=int, default=0)
+    ipc_so.add_argument("--coid",          type=int, help="client order id (default: time-derived)")
+    ipc_so.add_argument("--ref-order-id",  type=int, dest="ref_order_id",
+                        help="for CANCEL/REPLACE: original coid to operate on")
+    ipc_so.add_argument("--orders",   default=DEFAULT_ORDERS_SHM)
+    ipc_so.add_argument("--reports",  default=DEFAULT_REPORTS_SHM)
+    ipc_so.add_argument("--wait",     type=float, default=2.0,
+                        help="wait N seconds for report (0 = don't wait)")
+    ipc_so.set_defaults(func=cmd_ipc_send_order)
+
+    ipc_can = ipc.add_parser("cancel", help="send a CANCEL for an open order")
+    ipc_can.add_argument("--strategy", type=int, required=True)
+    ipc_can.add_argument("--coid",     type=int, required=True,
+                         help="client order id of the order to cancel")
+    ipc_can.add_argument("--symbol",   type=int, default=0)
+    ipc_can.add_argument("--account",  type=int, default=0)
+    ipc_can.add_argument("--orders",   default=DEFAULT_ORDERS_SHM)
+    ipc_can.add_argument("--reports",  default=DEFAULT_REPORTS_SHM)
+    ipc_can.add_argument("--wait",     type=float, default=2.0)
+    ipc_can.set_defaults(func=cmd_ipc_cancel)
+
+    ipc_rep = ipc.add_parser("replace", help="send a REPLACE for an open order")
+    ipc_rep.add_argument("--strategy", type=int, required=True)
+    ipc_rep.add_argument("--coid",     type=int, required=True,
+                         help="original client order id to replace")
+    ipc_rep.add_argument("--new-coid", type=int, dest="new_coid",
+                         help="fresh coid for the replacement (default: time-derived)")
+    ipc_rep.add_argument("--symbol",   type=int, required=True)
+    ipc_rep.add_argument("--side",     choices=["BUY", "SELL"], required=True)
+    ipc_rep.add_argument("--qty",      type=int, required=True)
+    ipc_rep.add_argument("--price",    type=float, required=True)
+    ipc_rep.add_argument("--account",  type=int, default=0)
+    ipc_rep.add_argument("--orders",   default=DEFAULT_ORDERS_SHM)
+    ipc_rep.add_argument("--reports",  default=DEFAULT_REPORTS_SHM)
+    ipc_rep.add_argument("--wait",     type=float, default=2.0)
+    ipc_rep.set_defaults(func=cmd_ipc_replace)
+
+    # ---- daemon ----
+    daemon = nest(add("daemon", help="manage the local fill-echo daemon"))
+    dst = daemon.add_parser("start", help="spawn gel_daemon in the background")
+    dst.add_argument("--orders",  default=DEFAULT_ORDERS_SHM)
+    dst.add_argument("--reports", default=DEFAULT_REPORTS_SHM)
+    dst.set_defaults(func=cmd_daemon_start)
+    daemon.add_parser("stop",   help="signal SIGINT, then SIGKILL after 2.5s") \
+          .set_defaults(func=cmd_daemon_stop)
+    daemon.add_parser("status", help="show running pid + log").set_defaults(func=cmd_daemon_status)
+
+    # ---- tools ----
+    add("admin",     help="open the account-admin web UI").set_defaults(func=cmd_admin)
+    add("python",    help="Python REPL with connector loaded").set_defaults(func=cmd_python)
+    add("doctor",    help="environment health check").set_defaults(func=cmd_doctor)
+    add("backtest",  help="historical replay (stub)").set_defaults(func=cmd_backtest_stub)
+    add("version",   help="version + git rev").set_defaults(func=cmd_version)
+    add("help",      help="show full command tree").set_defaults(func=cmd_help_full)
+
+    # ---- REPL family ----
+    add("status",     help="quick system status (daemon + config + binaries)").set_defaults(func=cmd_status)
+    con = add("connect", help="enter the interactive REPL")
+    con.add_argument("--no-start-daemon", action="store_true",
+                     help="don't auto-start the daemon when opening the REPL")
+    con.add_argument("--orders",  default=DEFAULT_ORDERS_SHM)
+    con.add_argument("--reports", default=DEFAULT_REPORTS_SHM)
+    con.set_defaults(func=cmd_connect)
+    add("disconnect", help="stop the daemon").set_defaults(func=cmd_disconnect)
+
+    return p
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.json:     out.json_mode = True
+    if args.quiet:    out.quiet     = True
+    if args.no_color: out.use_color = False
+
+    if not getattr(args, "func", None):
+        # Default to help when no subcommand was given.
+        return cmd_help_full(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        out.info("")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

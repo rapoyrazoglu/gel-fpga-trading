@@ -1,0 +1,67 @@
+# ---- Secrets / keys — NEVER commit --------------------------------------
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+.env
+.env.*
+!.env.example
+secrets*
+credentials*
+
+# ---- Market data (licensing + size) — do NOT commit ---------------------
+/GEL/data/
+/PCTA/pcta/data/
+*.csv
+*.parquet
+*.feather
+
+# ---- FPGA images / large build deliverables -----------------------------
+*.tar
+*.tar.gz
+afi_tarballs/
+*.dcp
+*.bit
+*.ltx
+*.awsxclbin
+*.xclbin
+
+# ---- Build artifacts ----------------------------------------------------
+build/
+build_release/
+build_demo/
+cmake-build*/
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+.Xil/
+vivado*.log
+vivado*.jou
+work-obj*.cf
+*.cf
+*.ghw
+*.vcd
+
+# ---- Python -------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- Node ---------------------------------------------------------------
+node_modules/
+
+# ---- OS / editor --------------------------------------------------------
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*.app/

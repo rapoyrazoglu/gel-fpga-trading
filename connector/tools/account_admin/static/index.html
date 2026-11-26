@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>connector — account admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://unpkg.com/vis-network@10.1.5/standalone/umd/vis-network.min.js"
+          integrity="sha384-GtjYkhwhAE+SrjDGQbQux3taYY5IiPH6XHwwKXF+WdyoI1hp193Dg+3BoQDfF7VH" crossorigin="anonymous"></script>
+  <style>
+    :root {
+      --bg:        #0e1116;
+      --panel:     #161b22;
+      --border:    #30363d;
+      --fg:        #e6edf3;
+      --muted:     #8b949e;
+      --accent:    #58a6ff;
+      --strategy:  #ffb454;
+      --account:   #7ee787;
+      --account-paper: #6cb6ff;
+      --danger:    #f85149;
+      --ok:        #56d364;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--bg); color: var(--fg);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 380px;
+      grid-template-rows: 48px 1fr;
+      grid-template-areas:
+        "header header"
+        "graph  panel";
+      height: 100vh;
+    }
+    header {
+      grid-area: header;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.04em; }
+    header .right { display: flex; gap: 12px; align-items: center; font-size: 12px; }
+    header .pill { padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+    header .pill.dirty { color: var(--danger); border-color: var(--danger); }
+    header .pill.saved { color: var(--ok);     border-color: var(--ok); }
+    header button {
+      background: var(--accent); color: #0d1117; border: 0;
+      padding: 6px 12px; border-radius: 4px;
+      font-family: inherit; font-size: 12px; font-weight: 600;
+      cursor: pointer;
+    }
+    header button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #graph {
+      grid-area: graph;
+      background: var(--bg);
+      border-right: 1px solid var(--border);
+    }
+    #panel {
+      grid-area: panel;
+      overflow-y: auto;
+      padding: 16px;
+      background: var(--panel);
+      font-size: 12px;
+    }
+    #panel section { margin-bottom: 24px; }
+    #panel h2 {
+      margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 4px;
+    }
+    .row {
+      display: grid; grid-template-columns: 1fr auto;
+      gap: 6px; padding: 6px 0;
+      border-bottom: 1px dashed var(--border);
+    }
+    .row .meta { color: var(--muted); font-size: 11px; }
+    .row .actions button {
+      background: transparent; border: 1px solid var(--border); color: var(--muted);
+      padding: 2px 8px; border-radius: 3px; cursor: pointer; font-family: inherit;
+      font-size: 11px;
+    }
+    .row .actions button:hover { color: var(--danger); border-color: var(--danger); }
+
+    form { display: grid; gap: 6px; margin-top: 8px; }
+    form .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    form input, form select {
+      background: var(--bg); border: 1px solid var(--border); color: var(--fg);
+      padding: 6px 8px; border-radius: 3px; font-family: inherit; font-size: 12px;
+    }
+    form input:focus, form select:focus { outline: 1px solid var(--accent); }
+    form button {
+      background: transparent; border: 1px solid var(--accent); color: var(--accent);
+      padding: 6px 8px; border-radius: 3px; cursor: pointer; font-family: inherit;
+      font-size: 12px; font-weight: 600;
+    }
+    form label.checkbox {
+      display: flex; align-items: center; gap: 6px; color: var(--muted);
+      padding: 4px 0;
+    }
+    .err { color: var(--danger); font-size: 11px; padding-top: 4px; }
+    .badge { font-size: 10px; color: var(--muted); margin-left: 6px; }
+    .badge.live { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>connector / account-admin</h1>
+    <div class="right">
+      <span id="status" class="pill saved">saved</span>
+      <button id="save-btn">Save</button>
+    </div>
+  </header>
+  <div id="graph"></div>
+  <div id="panel">
+
+    <section>
+      <h2>Strategies</h2>
+      <div id="strategy-list"></div>
+      <form id="strategy-form">
+        <div class="grid2">
+          <input type="number" name="id"   placeholder="id (1..255)"   min="1" max="65535" required />
+          <input type="text"   name="name" placeholder="name (e.g. PCTA)" required />
+        </div>
+        <button type="submit">+ add strategy</button>
+        <div class="err" id="strategy-err"></div>
+      </form>
+    </section>
+
+    <section>
+      <h2>Accounts</h2>
+      <div id="account-list"></div>
+      <form id="account-form">
+        <div class="grid2">
+          <input type="number" name="id"    placeholder="id (1..)" min="1" max="4294967295" required />
+          <input type="text"   name="label" placeholder="label (e.g. OANDA-PROP)" required />
+        </div>
+        <div class="grid2">
+          <input type="text"   name="venue" placeholder="venue" value="OANDA" />
+          <input type="number" name="capital_units" placeholder="capital units" value="100000" min="0" />
+        </div>
+        <label class="checkbox">
+          <input type="checkbox" name="live" />
+          live (real money — uncheck for paper)
+        </label>
+        <button type="submit">+ add account</button>
+        <div class="err" id="account-err"></div>
+      </form>
+    </section>
+
+    <section>
+      <h2>Assign</h2>
+      <form id="assign-form">
+        <div class="grid2">
+          <select name="strategy_id" required></select>
+          <select name="account_id"  required></select>
+        </div>
+        <button type="submit">+ assign</button>
+        <div class="err" id="assign-err"></div>
+      </form>
+    </section>
+
+  </div>
+
+<script>
+'use strict';
+
+let state    = { strategies: [], accounts: [], assignments: [] };
+let dirty    = false;
+let networkInst = null;
+
+const $ = sel => document.querySelector(sel);
+
+// ----- network rendering ------------------------------------------------
+function renderGraph() {
+  const nodes = [];
+  const edges = [];
+
+  for (const s of state.strategies) {
+    nodes.push({
+      id:    `s-${s.id}`,
+      label: `${s.name}\n#${s.id}`,
+      group: "strategy",
+      shape: "box",
+    });
+  }
+  for (const a of state.accounts) {
+    const live = a.live ? "  ●LIVE" : "";
+    nodes.push({
+      id:    `a-${a.id}`,
+      label: `${a.label}\n#${a.id} (${a.venue || ""})${live}`,
+      group: a.live ? "account_live" : "account_paper",
+      shape: "ellipse",
+    });
+  }
+  for (const x of state.assignments) {
+    edges.push({
+      from: `s-${x.strategy_id}`,
+      to:   `a-${x.account_id}`,
+      arrows: "to",
+      width: 2,
+    });
+  }
+
+  const data    = { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) };
+  const options = {
+    nodes: { font: { color: "#e6edf3", size: 13, multi: "html" } },
+    edges: { color: { color: "#58a6ff", highlight: "#79c0ff" }, smooth: { type: "cubicBezier" } },
+    groups: {
+      strategy:       { color: { background: "#3d2c0e", border: "#ffb454", highlight: { background: "#5a4116", border: "#ffb454" } } },
+      account_paper:  { color: { background: "#0c2740", border: "#6cb6ff", highlight: { background: "#15395d", border: "#6cb6ff" } } },
+      account_live:   { color: { background: "#1f3b22", border: "#7ee787", highlight: { background: "#284c2c", border: "#7ee787" } } },
+    },
+    physics: { stabilization: { iterations: 200 }, barnesHut: { gravitationalConstant: -2000, springLength: 160 } },
+    interaction: { hover: true },
+  };
+
+  if (networkInst) networkInst.destroy();
+  networkInst = new vis.Network($("#graph"), data, options);
+}
+
+// ----- panel rendering --------------------------------------------------
+function renderPanel() {
+  const slist = $("#strategy-list");
+  slist.innerHTML = "";
+  for (const s of state.strategies) {
+    const div = document.createElement("div");
+    div.className = "row";
+    div.innerHTML = `
+      <div>
+        <div>${escape_html(s.name)}</div>
+        <div class="meta">id=${escape_html(s.id)} · ${countAssignmentsForStrategy(s.id)} account(s)</div>
+      </div>
+      <div class="actions">
+        <button data-act="del-strategy" data-id="${escape_html(s.id)}">remove</button>
+      </div>`;
+    slist.appendChild(div);
+  }
+
+  const alist = $("#account-list");
+  alist.innerHTML = "";
+  for (const a of state.accounts) {
+    const div = document.createElement("div");
+    div.className = "row";
+    const liveBadge = a.live ? '<span class="badge live">LIVE</span>' : '<span class="badge">paper</span>';
+    div.innerHTML = `
+      <div>
+        <div>${escape_html(a.label)}${liveBadge}</div>
+        <div class="meta">id=${escape_html(a.id)} · ${escape_html(a.venue || "")} · ${escape_html(a.capital_units)} cap · ${countAssignmentsForAccount(a.id)} strat(s)</div>
+      </div>
+      <div class="actions">
+        <button data-act="del-account" data-id="${escape_html(a.id)}">remove</button>
+      </div>`;
+    alist.appendChild(div);
+  }
+
+  const sSel = $("#assign-form select[name=strategy_id]");
+  const aSel = $("#assign-form select[name=account_id]");
+  sSel.innerHTML = state.strategies.map(s => `<option value="${escape_html(s.id)}">${escape_html(s.name)} (#${escape_html(s.id)})</option>`).join("");
+  aSel.innerHTML = state.accounts  .map(a => `<option value="${escape_html(a.id)}">${escape_html(a.label)} (#${escape_html(a.id)})</option>`).join("");
+}
+
+function countAssignmentsForStrategy(sid) {
+  return state.assignments.filter(x => x.strategy_id === sid).length;
+}
+function countAssignmentsForAccount(aid) {
+  return state.assignments.filter(x => x.account_id === aid).length;
+}
+
+function escape_html(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// ----- mutations --------------------------------------------------------
+function markDirty() {
+  dirty = true;
+  const pill = $("#status");
+  pill.textContent = "unsaved";
+  pill.classList.remove("saved");
+  pill.classList.add("dirty");
+  $("#save-btn").disabled = false;
+}
+function markClean() {
+  dirty = false;
+  const pill = $("#status");
+  pill.textContent = "saved";
+  pill.classList.remove("dirty");
+  pill.classList.add("saved");
+  $("#save-btn").disabled = true;
+}
+
+function rerender() {
+  renderGraph();
+  renderPanel();
+}
+
+// ----- handlers ---------------------------------------------------------
+$("#strategy-form").addEventListener("submit", ev => {
+  ev.preventDefault();
+  const form = ev.target;
+  const id   = parseInt(form.id.value, 10);
+  const name = form.name.value.trim();
+  $("#strategy-err").textContent = "";
+  if (state.strategies.some(s => s.id === id)) {
+    $("#strategy-err").textContent = `id ${id} already exists`;
+    return;
+  }
+  state.strategies.push({ id, name });
+  form.reset();
+  markDirty();
+  rerender();
+});
+
+$("#account-form").addEventListener("submit", ev => {
+  ev.preventDefault();
+  const form = ev.target;
+  const id    = parseInt(form.id.value, 10);
+  const label = form.label.value.trim();
+  const venue = form.venue.value.trim();
+  const cap   = parseInt(form.capital_units.value, 10) || 0;
+  const live  = form.live.checked;
+  $("#account-err").textContent = "";
+  if (id === 0) { $("#account-err").textContent = "id 0 is reserved"; return; }
+  if (state.accounts.some(a => a.id === id)) {
+    $("#account-err").textContent = `id ${id} already exists`;
+    return;
+  }
+  state.accounts.push({ id, label, venue, capital_units: cap, live });
+  form.reset();
+  form.venue.value = "OANDA";
+  form.capital_units.value = "100000";
+  markDirty();
+  rerender();
+});
+
+$("#assign-form").addEventListener("submit", ev => {
+  ev.preventDefault();
+  const form = ev.target;
+  const sid  = parseInt(form.strategy_id.value, 10);
+  const aid  = parseInt(form.account_id.value,  10);
+  $("#assign-err").textContent = "";
+  if (state.assignments.some(x => x.strategy_id === sid && x.account_id === aid)) {
+    $("#assign-err").textContent = "already assigned";
+    return;
+  }
+  state.assignments.push({ strategy_id: sid, account_id: aid });
+  markDirty();
+  rerender();
+});
+
+document.addEventListener("click", ev => {
+  const t = ev.target;
+  if (!(t instanceof HTMLElement)) return;
+  const act = t.getAttribute("data-act");
+  if (!act) return;
+  const id = parseInt(t.getAttribute("data-id"), 10);
+
+  if (act === "del-strategy") {
+    state.strategies  = state.strategies .filter(s => s.id !== id);
+    state.assignments = state.assignments.filter(x => x.strategy_id !== id);
+    markDirty(); rerender();
+  } else if (act === "del-account") {
+    state.accounts    = state.accounts.filter(a => a.id !== id);
+    state.assignments = state.assignments.filter(x => x.account_id !== id);
+    markDirty(); rerender();
+  }
+});
+
+$("#save-btn").addEventListener("click", async () => {
+  const r = await fetch("/api/state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(state),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    alert("save failed: " + (body.error || r.statusText));
+    return;
+  }
+  markClean();
+});
+
+window.addEventListener("beforeunload", ev => {
+  if (dirty) { ev.preventDefault(); ev.returnValue = ""; }
+});
+
+// ----- bootstrap --------------------------------------------------------
+async function load() {
+  const r = await fetch("/api/state");
+  state = await r.json();
+  rerender();
+  markClean();
+}
+load();
+</script>
+</body>
+</html>
