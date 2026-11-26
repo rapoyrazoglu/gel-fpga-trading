@@ -36,24 +36,30 @@ if $CXX $STD -O2 $GI "$ROOT/GEL/src/scripts/fleet_demo.cpp" -o "$TMP/fleet" 2>>"
 
 echo "[FPGA RTL] GHDL testbenches"
 if command -v ghdl >/dev/null 2>&1; then
-  # Run inside the RTL dir with relative names: GHDL's library stores source
-  # paths, so analysis and run must share the same working directory.
-  read tpass tfail < <( cd "$ROOT/Market-Maker/fpga/rtl" && {
-    W="$TMP/ghdl"; mkdir -p "$W"
-    A() { ghdl -a --std=08 --workdir="$W" -fsynopsys "$1" >/dev/null 2>&1; }
+  # Work in a private copy of the RTL dir: every GHDL backend then keeps its
+  # library and binaries in the current directory (no backend-specific flags),
+  # and the benches still find pricing_vectors.txt by relative path.
+  cp -R "$ROOT/Market-Maker/fpga/rtl" "$TMP/rtl"
+  read tpass tfail < <( cd "$TMP/rtl" && {
+    G="--std=08 -fsynopsys"
+    A() { ghdl -a $G "$1" >"$TMP/a.log" 2>&1 || { echo "ANALYSIS FAILED: $1" >&2; head -5 "$TMP/a.log" >&2; }; }
     A mmx_pkg.vhd; A mmx_multi_pkg.vhd
     A sha256_core.vhd; A hmac_verify.vhd
-    for f in $(ls *.vhd | grep -vE '^tb_|_pkg\.vhd$|sha256_core|hmac_verify|mmx_dataplane'); do A "$f"; done
+    # Two passes: file-name order is not dependency order (a wrapper can sort
+    # before the module it instantiates). Only the second pass reports errors.
+    mods=$(ls *.vhd | grep -vE '^tb_|_pkg\.vhd$|sha256_core|hmac_verify|mmx_dataplane')
+    for f in $mods; do ghdl -a $G "$f" >/dev/null 2>&1 || true; done
+    for f in $mods; do A "$f"; done
     A param_block_loader.vhd; A mmx_dataplane.vhd
     for f in mutants/*.vhd; do A "$f"; done   # deliberately broken DUTs for the *_l2 benches
     for f in tb_*.vhd; do A "$f"; done
     tp=0; tf=0
     for tb in $(ls tb_*.vhd | sed 's/\.vhd//'); do
-      # elab-run (not -r): works on every GHDL backend and never reuses a stale binary
-      out=$(ghdl --elab-run --std=08 --workdir="$W" -fsynopsys -o "$W/$tb" "$tb" 2>&1)
-      if echo "$out" | grep -qiE "assertion violation|severity (error|failure)|report note\): FAIL"; then tf=$((tf+1)); echo "FAILED: $tb" >&2
+      # elab-run (not -r): works on every backend and never reuses a stale binary
+      out=$(ghdl --elab-run $G "$tb" 2>&1)
+      if echo "$out" | grep -qiE "assertion violation|severity (error|failure)|report note\): FAIL"; then tf=$((tf+1)); echo "FAILED: $tb" >&2; echo "$out" | tail -3 >&2
       elif echo "$out" | grep -qiE "report note\): PASS|PASS:"; then tp=$((tp+1))
-      else tf=$((tf+1)); echo "NO VERDICT: $tb" >&2; fi
+      else tf=$((tf+1)); echo "NO VERDICT: $tb" >&2; echo "$out" | tail -3 >&2; fi
     done
     echo "$tp $tf"
   } )
